@@ -1,0 +1,270 @@
+import axios, { type AxiosInstance } from 'axios';
+import io from 'socket.io-client';
+import { debounce } from 'lodash';
+import { toast } from 'react-toastify';
+
+const API_BASE_URL = import.meta.env.VITE_API_URL;
+const api: AxiosInstance = axios.create({
+  baseURL: API_BASE_URL,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  // Add timestamp to POST request body for routes requiring it
+  if (config.method === 'post' && config.data && ['/accounts/add', '/accounts/confirm'].includes(config.url || '')) {
+    config.data.timestamp = Date.now();
+  }
+  return config;
+});
+
+export interface SignupData {
+  email: string;
+  mobile: string;
+  password: string;
+  firstName: string;
+  lastName: string;
+}
+
+export interface LoginData {
+  emailOrMobile: string;
+  password: string;
+}
+
+export interface AccountData {
+  _id?: string;
+  brokerName: string;
+  accountId: string;
+  apiKey: string;
+  location: string;
+  maxPositionLimit: number | undefined;
+  splittingTarget: number | undefined;
+  riskPercentage: number | undefined;
+  autoLotSizeSet: boolean;
+  dailyRiskPercentage?: number;
+  timezone?: string;
+  timestamp?: number; // Added for receive window
+}
+
+export interface OrderData {
+  symbol: string;
+  entryType: 'buy' | 'sell';
+  lotSize?: number;
+  stopLoss?: number;
+  takeProfit?: number | number[];
+  _id: string;
+  orderType: 'Market' | 'Stop' | 'Limit';
+  entryPrice?: number;
+  comment?: string;
+  timestamp: number; // Added for receive window
+}
+
+export interface Position {
+  positionId: string;
+  symbol: string;
+  lotSize: number;
+  entryTime: string;
+  stopLoss: number;
+  takeProfit?: number;
+  profitLoss: number;
+  accountId: string;
+}
+
+let socket: any = null;
+
+// Debounced functions for rate limiting (3-second gap)
+const debouncedVerifyOrder = debounce(
+  (data: OrderData, userId: string) => verifyOrder(data, userId),
+  3000,
+  { leading: true, trailing: false }
+);
+const debouncedPlaceOrder = debounce(
+  (data: OrderData, userId: string) => placeOrder(data, userId),
+  3000,
+  { leading: true, trailing: false }
+);
+const debouncedAddAccount = debounce(
+  (data: AccountData) => addAccount(data),
+  3000,
+  { leading: true, trailing: false }
+);
+const debouncedConfirmAccount = debounce(
+  (data: AccountData) => confirmAccount(data),
+  3000,
+  { leading: true, trailing: false }
+);
+
+export const initializeSocket = (token: string, accountId: string) => {
+  if (socket) {
+    socket.disconnect();
+    socket = null;
+  }
+  socket = io(API_BASE_URL, {
+    auth: { token, accountId },
+  });
+  socket.on('connect', () => {
+    console.log(`Socket.IO connected for account ${accountId}`);
+    toast.success(`Connected to account ${accountId}`);
+  });
+  socket.on('disconnect', () => {
+    console.log(`Socket.IO disconnected for account ${accountId}`);
+    toast.warn(`Disconnected from account ${accountId}`);
+  });
+  socket.on('order-response', (response: { message?: string; positionIds?: string[]; error?: string }) => {
+    console.log('Order response:', response);
+    if (response.error) {
+      toast.error(response.error);
+    } else {
+      toast.success(response.message || 'Order placed successfully');
+    }
+  });
+  socket.on('equity-balance', (data: { accountId: string; equity: number; balance: number }) => {
+    console.log(`[${new Date().toISOString()}] Equity/Balance:`, data);
+  });
+  return socket;
+};
+
+export const getSocket = () => socket;
+
+export const verifyOrder = async (data: OrderData, userId: string) => {
+  if (!socket) {
+    const error = 'Socket.IO not connected';
+    console.error(`[${new Date().toISOString()}] ${error}`);
+    toast.error(error);
+    throw new Error(error);
+  }
+  const orderData = { ...data, timestamp: Date.now() };
+  return new Promise((resolve, reject) => {
+    socket.emit('verify-order', orderData);
+    socket.on('verify-order-response', (response: { data?: any; error?: string }) => {
+      console.log(`[${new Date().toISOString()}] Received verify order response:`, response);
+      if (response.error) {
+        console.error(`[${new Date().toISOString()}] Verify order failed: ${response.error}`);
+        toast.error(response.error);
+        reject(new Error(response.error));
+      } else {
+        toast.success('Order verified successfully');
+        resolve(response.data);
+      }
+    });
+  });
+};
+
+export const placeOrder = async (data: OrderData, userId: string) => {
+  if (!socket) {
+    const error = 'Socket.IO not connected';
+    console.error(`[${new Date().toISOString()}] ${error}`);
+    toast.error(error);
+    throw new Error(error);
+  }
+  const orderData = { ...data, timestamp: Date.now() };
+  return new Promise((resolve, reject) => {
+    socket.emit('place-order', orderData);
+    socket.on('order-response', (response: { message?: string; positionIds?: string[]; error?: string }) => {
+      console.log(`[${new Date().toISOString()}] Received order response:`, response);
+      if (response.error) {
+        console.error(`[${new Date().toISOString()}] Order failed:`, response.error);
+        toast.error(response.error);
+        reject(new Error(response.error));
+      } else {
+        toast.success(response.message || 'Order placed successfully');
+        resolve(response);
+      }
+    });
+  });
+};
+
+export const signup = async (data: SignupData) => {
+  try {
+    const response = await api.post('/auth/signup', data);
+    toast.success('Signup successful');
+    return response.data;
+  } catch (error: any) {
+    const errorMessage = error.response?.data?.error || 'Signup failed';
+    toast.error(errorMessage);
+    throw new Error(errorMessage);
+  }
+};
+
+export const login = async (data: LoginData) => {
+  try {
+    const response = await api.post('/auth/login', data);
+    if (response.message === 'Login successful' && response.token && response.userId) {
+      localStorage.setItem('userId', response.userId);
+      toast.success('Login successful');
+    } else {
+      toast.error('Unexpected response from server');
+    }
+    return response.data;
+  } catch (error: any) {
+    const errorMessage = error.response?.data?.error || 'Login failed';
+    toast.error(errorMessage);
+    throw new Error(errorMessage);
+  }
+};
+
+export const addAccount = async (data: AccountData) => {
+  const response = await api.post('/accounts/add', data);
+  if ('error' in response) {
+    toast.error(response.error);
+    throw new Error(response.error);
+  }
+  toast.success('Account verified successfully');
+  return response.data;
+};
+
+export const confirmAccount = async (data: AccountData) => {
+  const response = await api.post('/accounts/confirm', data);
+  if ('error' in response) {
+    toast.error(response.error);
+    throw new Error(response.error);
+  }
+  toast.success('Account confirmed successfully');
+  return response.data;
+};
+
+export const verifyToken = async () => {
+  try {
+    const response = await api.get('/auth/verify-token');
+    return response.data;
+  } catch (error: any) {
+    const errorMessage = error.response?.data?.error || 'Token verification failed';
+    toast.error(errorMessage);
+    throw new Error(errorMessage);
+  }
+};
+
+export const getUserAccounts = async () => {
+  try {
+    const response = await api.get('/account-details/accounts');
+    const accounts = response.data.map((account: any) => ({
+      _id: account._id,
+      brokerName: account.brokerName,
+      accountId: account.accountId,
+      maxPositionLimit: account.maxPositionLimit,
+    }));
+    return accounts;
+  } catch (error: any) {
+    const errorMessage = error.response?.data?.error || 'Failed to fetch accounts';
+    toast.error(errorMessage);
+    throw new Error(errorMessage);
+  }
+};
+
+export const logout = () => {
+  if (socket) {
+    socket.disconnect();
+    socket = null;
+  }
+  localStorage.removeItem('token');
+  localStorage.removeItem('userId');
+  toast.success('Logged out successfully');
+};
+
+// Export debounced functions for use in UI
+export { debouncedPlaceOrder, debouncedVerifyOrder, debouncedAddAccount, debouncedConfirmAccount };
